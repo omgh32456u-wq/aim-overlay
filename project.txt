@@ -1,1 +1,499 @@
+=== settings.gradle ===
+pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+rootProject.name = "AimOverlay"
+include ':app'
+=== build.gradle ===
+plugins { id 'com.android.application' version '8.5.2' apply false }
+=== gradle.properties ===
+org.gradle.jvmargs=-Xmx3g
+android.useAndroidX=true
+=== app/build.gradle ===
+plugins { id 'com.android.application' }
+android {
+    namespace 'app.aim'
+    compileSdk 34
+    defaultConfig {
+        applicationId 'app.aim.overlay'
+        minSdk 30
+        targetSdk 34
+        versionCode 1
+        versionName '1.0'
+        ndk { abiFilters 'arm64-v8a' }
+    }
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+}
+dependencies { implementation 'org.opencv:opencv:4.9.0' }
+=== app/src/main/AndroidManifest.xml ===
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW"/>
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION"/>
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
+    <application android:label="Aim Overlay" android:theme="@android:style/Theme.Material.Light">
+        <activity android:name=".MainActivity" android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN"/>
+                <category android:name="android.intent.category.LAUNCHER"/>
+            </intent-filter>
+        </activity>
+        <service android:name=".CaptureService" android:exported="false"
+                 android:foregroundServiceType="mediaProjection"/>
+    </application>
+</manifest>
+=== app/src/main/java/app/aim/MainActivity.java ===
+package app.aim;
 
+import android.Manifest;
+import android.app.Activity;
+import android.content.Intent;
+import android.content.pm.PackageManager;
+import android.media.projection.MediaProjectionManager;
+import android.net.Uri;
+import android.os.Bundle;
+import android.provider.Settings;
+import android.widget.Button;
+import android.widget.LinearLayout;
+import android.widget.TextView;
+import android.widget.Toast;
+
+public class MainActivity extends Activity {
+    @Override protected void onCreate(Bundle b) {
+        super.onCreate(b);
+        if (checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED)
+            requestPermissions(new String[]{Manifest.permission.POST_NOTIFICATIONS}, 2);
+        LinearLayout l = new LinearLayout(this);
+        l.setOrientation(LinearLayout.VERTICAL);
+        l.setPadding(48, 96, 48, 48);
+        TextView t = new TextView(this);
+        t.setTextSize(16);
+        t.setText("1) START\n2) allow 'display over other apps' (press START again after)\n3) allow screen capture\n4) open 8 Ball Pool in landscape\n\nPanel: :: drag | group | ON/OFF | DBG | RECAL | X");
+        Button s = new Button(this); s.setText("START");
+        s.setOnClickListener(v -> start());
+        Button x = new Button(this); x.setText("STOP");
+        x.setOnClickListener(v -> stopService(new Intent(this, CaptureService.class)));
+        l.addView(t); l.addView(s); l.addView(x);
+        setContentView(l);
+    }
+
+    private void start() {
+        if (!Settings.canDrawOverlays(this)) {
+            startActivity(new Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:" + getPackageName())));
+            Toast.makeText(this, "allow it, come back, press START again", Toast.LENGTH_LONG).show();
+            return;
+        }
+        MediaProjectionManager m = (MediaProjectionManager) getSystemService(MEDIA_PROJECTION_SERVICE);
+        startActivityForResult(m.createScreenCaptureIntent(), 1);
+    }
+
+    @Override protected void onActivityResult(int req, int res, Intent d) {
+        super.onActivityResult(req, res, d);
+        if (req == 1 && res == RESULT_OK && d != null) {
+            Intent i = new Intent(this, CaptureService.class);
+            i.putExtra("code", res);
+            i.putExtra("data", d);
+            startForegroundService(i);
+            finish();
+        }
+    }
+}
+=== app/src/main/java/app/aim/CaptureService.java ===
+package app.aim;
+
+import android.app.Notification;
+import android.app.NotificationChannel;
+import android.app.NotificationManager;
+import android.app.Service;
+import android.content.Intent;
+import android.content.pm.ServiceInfo;
+import android.graphics.PixelFormat;
+import android.graphics.Rect;
+import android.hardware.display.DisplayManager;
+import android.hardware.display.VirtualDisplay;
+import android.media.Image;
+import android.media.ImageReader;
+import android.media.projection.MediaProjection;
+import android.media.projection.MediaProjectionManager;
+import android.os.Handler;
+import android.os.HandlerThread;
+import android.os.IBinder;
+import android.os.Looper;
+import android.os.SystemClock;
+import android.util.Log;
+import android.view.Gravity;
+import android.view.MotionEvent;
+import android.view.View;
+import android.view.ViewGroup;
+import android.view.WindowManager;
+import android.widget.LinearLayout;
+import android.widget.TextView;
+import android.widget.Toast;
+import org.opencv.android.OpenCVLoader;
+import org.opencv.core.CvType;
+import org.opencv.core.Mat;
+import java.nio.ByteBuffer;
+
+public class CaptureService extends Service {
+    private static final String[] GN = {"SOLID", "STRIPE", "8-BALL"};
+    private WindowManager wm;
+    private MediaProjection mp;
+    private VirtualDisplay vd;
+    private ImageReader ir;
+    private AimView aim;
+    private LinearLayout panel;
+    private HandlerThread ht;
+    private Handler bg;
+    private final Vision vision = new Vision();
+    private volatile int group = 0;
+    private volatile boolean show = true, debug = false, recal = true;
+    private int capW, capH;
+    private long last = 0;
+    private boolean started = false;
+
+    @Override public IBinder onBind(Intent i) { return null; }
+
+    @Override public int onStartCommand(Intent in, int flags, int id) {
+        if (started || in == null) return START_NOT_STICKY;
+        started = true;
+        NotificationManager nm = getSystemService(NotificationManager.class);
+        nm.createNotificationChannel(new NotificationChannel("aim", "Aim overlay", NotificationManager.IMPORTANCE_LOW));
+        Notification n = new Notification.Builder(this, "aim")
+                .setContentTitle("Aim overlay running")
+                .setSmallIcon(android.R.drawable.ic_menu_view).build();
+        startForeground(7, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION);
+        if (!OpenCVLoader.initLocal()) {
+            Toast.makeText(this, "OpenCV init failed", Toast.LENGTH_LONG).show();
+            stopSelf();
+            return START_NOT_STICKY;
+        }
+        MediaProjectionManager mpm = (MediaProjectionManager) getSystemService(MEDIA_PROJECTION_SERVICE);
+        Intent data = in.getParcelableExtra("data");
+        mp = mpm.getMediaProjection(in.getIntExtra("code", 0), data);
+        mp.registerCallback(new MediaProjection.Callback() {
+            @Override public void onStop() { stopSelf(); }
+        }, new Handler(Looper.getMainLooper()));
+
+        wm = getSystemService(WindowManager.class);
+        Rect b = wm.getMaximumWindowMetrics().getBounds();
+        int L = Math.max(b.width(), b.height()), S = Math.min(b.width(), b.height());
+        capW = 1000;                                   // landscape capture, downscaled for speed
+        capH = Math.round(1000f * S / L);
+        ht = new HandlerThread("aim"); ht.start();
+        bg = new Handler(ht.getLooper());
+        ir = ImageReader.newInstance(capW, capH, PixelFormat.RGBA_8888, 2);
+        vd = mp.createVirtualDisplay("aim", capW, capH, getResources().getDisplayMetrics().densityDpi,
+                DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR, ir.getSurface(), null, null);
+        ir.setOnImageAvailableListener(r -> frame(), bg);
+        buildOverlay();
+        return START_NOT_STICKY;
+    }
+
+    private void frame() {
+        Image img = null;
+        try {
+            img = ir.acquireLatestImage();
+            if (img == null) return;
+            long now = SystemClock.uptimeMillis();
+            if (now - last < 100) return;
+            last = now;
+            Image.Plane p = img.getPlanes()[0];
+            ByteBuffer buf = p.getBuffer();
+            int rs = p.getRowStride(), w = img.getWidth(), h = img.getHeight();
+            byte[] arr = new byte[rs * h];
+            buf.get(arr, 0, Math.min(buf.remaining(), arr.length));
+            Mat full = new Mat(h, rs / 4, CvType.CV_8UC4);
+            full.put(0, 0, arr);
+            Mat rgba = full.colRange(0, w).clone();
+            full.release();
+            boolean rc = recal; recal = false;
+            Vision.Result res = vision.analyze(rgba, group, rc);
+            rgba.release();
+            aim.update(show ? res : null, w, h, debug);
+        } catch (Throwable e) {
+            Log.e("aim", "frame", e);
+        } finally {
+            if (img != null) img.close();
+        }
+    }
+
+    private TextView btn(String s) {
+        TextView t = new TextView(this);
+        t.setText(s); t.setTextColor(0xFFFFFFFF); t.setTextSize(13); t.setPadding(28, 18, 28, 18);
+        return t;
+    }
+
+    private void buildOverlay() {
+        // alpha 0.8 on purpose: Android 12+ blocks touches reaching the game under a fully opaque overlay window
+        aim = new AimView(this);
+        WindowManager.LayoutParams lp = new WindowManager.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT,
+                WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE | WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+                        | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN | WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+                PixelFormat.TRANSLUCENT);
+        lp.alpha = 0.8f;
+        lp.layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS;
+        wm.addView(aim, lp);
+
+        panel = new LinearLayout(this);
+        panel.setOrientation(LinearLayout.HORIZONTAL);
+        panel.setBackgroundColor(0xAA000000);
+        TextView grip = btn("::"), g = btn(GN[0]), on = btn("ON"), dbg = btn("DBG"), rc = btn("RECAL"), x = btn("X");
+        g.setOnClickListener(v -> { group = (group + 1) % 3; g.setText(GN[group]); });
+        on.setOnClickListener(v -> { show = !show; on.setText(show ? "ON" : "OFF"); });
+        dbg.setOnClickListener(v -> debug = !debug);
+        rc.setOnClickListener(v -> recal = true);
+        x.setOnClickListener(v -> stopSelf());
+        panel.addView(grip); panel.addView(g); panel.addView(on); panel.addView(dbg); panel.addView(rc); panel.addView(x);
+
+        final WindowManager.LayoutParams pl = new WindowManager.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT,
+                WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE | WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+                PixelFormat.TRANSLUCENT);
+        pl.alpha = 0.8f;
+        pl.gravity = Gravity.TOP | Gravity.START;
+        pl.x = 40; pl.y = 40;
+        grip.setOnTouchListener(new View.OnTouchListener() {
+            float dx, dy; int sx, sy;
+            @Override public boolean onTouch(View v, MotionEvent e) {
+                switch (e.getAction()) {
+                    case MotionEvent.ACTION_DOWN:
+                        dx = e.getRawX(); dy = e.getRawY(); sx = pl.x; sy = pl.y; return true;
+                    case MotionEvent.ACTION_MOVE:
+                        pl.x = sx + (int) (e.getRawX() - dx); pl.y = sy + (int) (e.getRawY() - dy);
+                        wm.updateViewLayout(panel, pl); return true;
+                }
+                return false;
+            }
+        });
+        wm.addView(panel, pl);
+    }
+
+    @Override public void onDestroy() {
+        try { if (aim != null) wm.removeView(aim); } catch (Exception e) { }
+        try { if (panel != null) wm.removeView(panel); } catch (Exception e) { }
+        try { if (vd != null) vd.release(); } catch (Exception e) { }
+        try { if (ir != null) ir.close(); } catch (Exception e) { }
+        try { if (mp != null) mp.stop(); } catch (Exception e) { }
+        if (ht != null) ht.quitSafely();
+        super.onDestroy();
+    }
+}
+=== app/src/main/java/app/aim/AimView.java ===
+package app.aim;
+
+import android.content.Context;
+import android.graphics.Canvas;
+import android.graphics.Paint;
+import android.view.View;
+
+final class AimView extends View {
+    private final Paint p = new Paint();
+    private volatile Vision.Result res;
+    private volatile int cw = 1, ch = 1;
+    private volatile boolean dbg;
+
+    AimView(Context c) {
+        super(c);
+        p.setColor(0xFFFF00FF);          // pure magenta: Vision masks this colour out of the capture
+        p.setStyle(Paint.Style.STROKE);
+        p.setStrokeWidth(6);
+        p.setAntiAlias(false);
+    }
+
+    void update(Vision.Result r, int w, int h, boolean d) { res = r; cw = w; ch = h; dbg = d; postInvalidate(); }
+
+    @Override protected void onDraw(Canvas c) {
+        Vision.Result r = res;
+        if (r == null) return;
+        float sx = getWidth() / (float) cw, sy = getHeight() / (float) ch, rad = (float) r.r * sx;
+        if (dbg) {
+            for (Vision.Ball b : r.balls) c.drawCircle(b.x * sx, b.y * sy, rad, p);
+            c.drawRect(r.tx * sx, r.ty * sy, (r.tx + r.tw) * sx, (r.ty + r.th) * sy, p);
+        }
+        Vision.Shot s = r.shot;
+        if (s == null) return;
+        c.drawLine((float) (s.cx * sx), (float) (s.cy * sy), (float) (s.gx * sx), (float) (s.gy * sy), p);
+        c.drawCircle((float) (s.gx * sx), (float) (s.gy * sy), rad, p);
+        c.drawLine((float) (s.tx * sx), (float) (s.ty * sy), (float) (s.px * sx), (float) (s.py * sy), p);
+        c.drawCircle((float) (s.px * sx), (float) (s.py * sy), rad * 0.6f, p);
+    }
+}
+=== app/src/main/java/app/aim/Vision.java ===
+package app.aim;
+
+import org.opencv.core.Core;
+import org.opencv.core.CvType;
+import org.opencv.core.Mat;
+import org.opencv.core.MatOfFloat;
+import org.opencv.core.MatOfInt;
+import org.opencv.core.MatOfPoint;
+import org.opencv.core.Point;
+import org.opencv.core.Rect;
+import org.opencv.core.Scalar;
+import org.opencv.core.Size;
+import org.opencv.imgproc.Imgproc;
+import org.opencv.photo.Photo;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+
+final class Vision {
+    static final double R_RATIO = 0.0128;  // FILL: ball radius / table length. press DBG: if circles are too big/small, change this
+    static final double INSET = 0.0;       // FILL: shrink table rect (fraction of width) if cushions got counted as cloth. DBG draws the rect
+    static final double MIN_COS = 0.25, CLEAR = 0.97;
+    static final int CUE = 0, SOLID = 1, STRIPE = 2, EIGHT = 3;
+
+    static final class Ball { float x, y, wf; int kind; }
+    static final class Shot { double cx, cy, gx, gy, tx, ty, px, py; }
+    static final class Result {
+        final List<Ball> balls = new ArrayList<>();
+        Shot shot; double r; int tx, ty, tw, th;
+    }
+
+    private Rect table;
+    private int hue;
+
+    Result analyze(Mat rgba, int group, boolean recal) {
+        Result out = new Result();
+        int W = rgba.cols(), H = rgba.rows();
+        Mat bgr = new Mat(); Imgproc.cvtColor(rgba, bgr, Imgproc.COLOR_RGBA2BGR);
+        Mat hsv = new Mat(); Imgproc.cvtColor(bgr, hsv, Imgproc.COLOR_BGR2HSV);
+
+        // remove our own magenta overlay from the frame so it can't be detected as balls
+        Mat mag = new Mat();
+        Core.inRange(hsv, new Scalar(142, 100, 130), new Scalar(158, 255, 255), mag);
+        if (Core.countNonZero(mag) > 20) {
+            Imgproc.dilate(mag, mag, Imgproc.getStructuringElement(Imgproc.MORPH_RECT, new Size(5, 5)));
+            Mat fixed = new Mat();
+            Photo.inpaint(bgr, mag, fixed, 3, Photo.INPAINT_TELEA);
+            bgr.release(); bgr = fixed;
+            Imgproc.cvtColor(bgr, hsv, Imgproc.COLOR_BGR2HSV);
+        }
+        mag.release();
+
+        if (table == null || recal) calibrate(hsv, W, H);
+        if (table == null) { bgr.release(); hsv.release(); return out; }
+        Rect t = table;
+        out.tx = t.x; out.ty = t.y; out.tw = t.width; out.th = t.height;
+        double L = Math.max(t.width, t.height), r = L * R_RATIO;
+        out.r = r;
+
+        Mat cloth = new Mat(); Core.inRange(hsv, new Scalar(hue - 12, 50, 30), new Scalar(hue + 12, 255, 255), cloth);
+        Mat white = new Mat(); Core.inRange(hsv, new Scalar(0, 0, 170), new Scalar(180, 60, 255), white);
+        Mat dark = new Mat(); Core.inRange(hsv, new Scalar(0, 0, 0), new Scalar(180, 255, 70), dark);
+        Mat gray = new Mat(); Imgproc.cvtColor(bgr, gray, Imgproc.COLOR_BGR2GRAY);
+        Mat roi = gray.submat(t).clone();
+        Imgproc.medianBlur(roi, roi, 5);
+        Mat circles = new Mat();
+        Imgproc.HoughCircles(roi, circles, Imgproc.HOUGH_GRADIENT, 1, r * 1.7, 100, 14, (int) (r * 0.8), (int) (r * 1.2));
+
+        // pockets: 4 corners + 2 middle (landscape table)
+        double[][] pk = {
+            {t.x, t.y}, {t.x + t.width, t.y}, {t.x, t.y + t.height}, {t.x + t.width, t.y + t.height},
+            {t.x + t.width / 2.0, t.y}, {t.x + t.width / 2.0, t.y + t.height}};
+
+        for (int i = 0; i < circles.cols(); i++) {
+            float[] c = new float[3];
+            circles.get(0, i, c);
+            double x = c[0] + t.x, y = c[1] + t.y;
+            boolean nearPocket = false;
+            for (double[] p : pk) if (Math.hypot(x - p[0], y - p[1]) < r * 1.1) nearPocket = true;
+            if (nearPocket) continue;
+            int x0 = (int) Math.max(x - r, 0), y0 = (int) Math.max(y - r, 0);
+            int x1 = (int) Math.min(x + r + 1, W), y1 = (int) Math.min(y + r + 1, H);
+            if (x1 - x0 < 4 || y1 - y0 < 4) continue;
+            Rect box = new Rect(x0, y0, x1 - x0, y1 - y0);
+            Mat m = Mat.zeros(box.height, box.width, CvType.CV_8UC1);
+            Imgproc.circle(m, new Point(x - x0, y - y0), (int) Math.round(0.8 * r), new Scalar(255), -1);
+            double cf = Core.mean(cloth.submat(box), m).val[0] / 255.0;
+            double wf = Core.mean(white.submat(box), m).val[0] / 255.0;
+            double df = Core.mean(dark.submat(box), m).val[0] / 255.0;
+            m.release();
+            if (cf > 0.45) continue;
+            Ball b = new Ball();
+            b.x = (float) x; b.y = (float) y; b.wf = (float) wf;
+            // thresholds are heuristics: tune if stripes/solids flip on your table skin
+            b.kind = wf > 0.80 ? CUE : df > 0.55 ? EIGHT : wf > 0.22 ? STRIPE : SOLID;
+            out.balls.add(b);
+        }
+        out.shot = choose(out.balls, group + 1, pk, r, L, t);
+        for (Mat mm : new Mat[]{bgr, hsv, cloth, white, dark, gray, roi, circles}) mm.release();
+        return out;
+    }
+
+    // table = largest cloth-coloured blob; cloth hue = most common saturated hue in the centre of the frame
+    private void calibrate(Mat hsv, int W, int H) {
+        Mat c = hsv.submat(new Rect(W / 4, H / 4, W / 2, H / 2));
+        Mat sat = new Mat();
+        Core.inRange(c, new Scalar(0, 50, 40), new Scalar(179, 255, 255), sat);
+        List<Mat> ch = new ArrayList<>();
+        Core.split(c, ch);
+        Mat hist = new Mat();
+        Imgproc.calcHist(Collections.singletonList(ch.get(0)), new MatOfInt(0), sat, hist, new MatOfInt(180), new MatOfFloat(0f, 180f));
+        hue = (int) Core.minMaxLoc(hist).maxLoc.y;
+        Mat cloth = new Mat();
+        Core.inRange(hsv, new Scalar(hue - 12, 50, 30), new Scalar(hue + 12, 255, 255), cloth);
+        Mat closed = new Mat();
+        Imgproc.morphologyEx(cloth, closed, Imgproc.MORPH_CLOSE, Imgproc.getStructuringElement(Imgproc.MORPH_ELLIPSE, new Size(25, 25)));
+        List<MatOfPoint> cs = new ArrayList<>();
+        Imgproc.findContours(closed, cs, new Mat(), Imgproc.RETR_EXTERNAL, Imgproc.CHAIN_APPROX_SIMPLE);
+        double best = 0; Rect br = null;
+        for (MatOfPoint cnt : cs) {
+            double a = Imgproc.contourArea(cnt);
+            if (a > best) { best = a; br = Imgproc.boundingRect(cnt); }
+        }
+        if (br != null && br.width > W * 0.4) {
+            int in = (int) (br.width * INSET);
+            table = new Rect(br.x + in, br.y + in, br.width - 2 * in, br.height - 2 * in);
+        }
+    }
+
+    private static double segDist(double px, double py, double ax, double ay, double bx, double by) {
+        double abx = bx - ax, aby = by - ay, L = abx * abx + aby * aby;
+        double t = L < 1e-9 ? 0 : Math.max(0, Math.min(1, ((px - ax) * abx + (py - ay) * aby) / L));
+        return Math.hypot(px - (ax + abx * t), py - (ay + aby * t));
+    }
+
+    // ghost-ball method: best direct pot = highest (cut-angle cosine / path length) with clear lanes
+    private Shot choose(List<Ball> balls, int kind, double[][] pk, double r, double L, Rect t) {
+        Ball cb = null;
+        for (Ball b : balls) if (b.kind == CUE && (cb == null || b.wf > cb.wf)) cb = b;
+        if (cb == null) return null;
+        Shot best = null; double bs = -1;
+        for (Ball tb : balls) {
+            if (tb.kind != kind) continue;
+            for (double[] p : pk) {
+                double vx = p[0] - tb.x, vy = p[1] - tb.y, d2 = Math.hypot(vx, vy);
+                if (d2 < 1e-6) continue;
+                double ux = vx / d2, uy = vy / d2;
+                double gx = tb.x - ux * 2 * r, gy = tb.y - uy * 2 * r;
+                if (gx < t.x || gx > t.x + t.width || gy < t.y || gy > t.y + t.height) continue;
+                double wx = gx - cb.x, wy = gy - cb.y, d1 = Math.hypot(wx, wy);
+                if (d1 < 1e-6) continue;
+                double cos = (wx * ux + wy * uy) / d1;
+                if (cos < MIN_COS) continue;
+                boolean blocked = false;
+                for (Ball o : balls) {
+                    if (o == cb || o == tb) continue;
+                    if (segDist(o.x, o.y, cb.x, cb.y, gx, gy) < 2 * r * CLEAR
+                            || segDist(o.x, o.y, tb.x, tb.y, p[0], p[1]) < 2 * r * CLEAR) { blocked = true; break; }
+                }
+                if (blocked) continue;
+                double s = cos / (1 + (d1 + d2) / L);
+                if (s > bs) {
+                    bs = s;
+                    Shot sh = new Shot();
+                    sh.cx = cb.x; sh.cy = cb.y; sh.gx = gx; sh.gy = gy; sh.tx = tb.x; sh.ty = tb.y; sh.px = p[0]; sh.py = p[1];
+                    best = sh;
+                }
+            }
+        }
+        return best;
+    }
+}
