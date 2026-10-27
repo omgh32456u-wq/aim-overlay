@@ -279,10 +279,12 @@ public class CaptureService extends Service {
         try { if (vd != null) vd.release(); } catch (Exception e) { }
         try { if (ir != null) ir.close(); } catch (Exception e) { }
         try { if (mp != null) mp.stop(); } catch (Exception e) { }
-        if (ht != null) ht.quitSafely();
+                if (ht != null) ht.quitSafely();
         super.onDestroy();
     }
+}
 
+=== app/src/main/java/app/aim/Vision.java ===
 package app.aim;
 
 import org.opencv.core.Core;
