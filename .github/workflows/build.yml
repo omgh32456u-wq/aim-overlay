@@ -1,1 +1,40 @@
-
+name: build
+on:
+  push:
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+      - name: unpack project.txt
+        run: |
+          python3 - <<'PY'
+          import os
+          files = {}
+          cur = None
+          for line in open('project.txt', encoding='utf-8'):
+              if line.startswith('=== ') and line.rstrip().endswith(' ==='):
+                  cur = line.strip()[4:-4].strip()
+                  files[cur] = []
+              elif cur:
+                  files[cur].append(line)
+          for p, l in files.items():
+              os.makedirs(os.path.dirname(p) or '.', exist_ok=True)
+              open(p, 'w', encoding='utf-8').write(''.join(l))
+          PY
+      - name: build
+        run: gradle assembleDebug --no-daemon
+      - name: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "v${{ github.run_number }}" app/build/outputs/apk/debug/app-debug.apk --title "build ${{ github.run_number }}" --notes "apk"
