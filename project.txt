@@ -284,6 +284,113 @@ public class CaptureService extends Service {
     }
 }
 
+=== app/src/main/java/app/aim/AimView.java ===
+package app.aim;
+
+import android.content.Context;
+import android.graphics.Canvas;
+import android.graphics.Color;
+import android.graphics.Paint;
+import android.view.View;
+
+import java.util.List;
+
+public final class AimView extends View {
+private volatile Vision.Result result;
+private volatile int frameW = 1000;
+private volatile int frameH = 450;
+private volatile boolean debug = false;
+
+private final Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
+
+public AimView(Context context) {
+    super(context);
+    setLayerType(View.LAYER_TYPE_SOFTWARE, null);
+}
+
+public void update(Vision.Result r, int w, int h, boolean showDebug) {
+    result = r;
+    frameW = Math.max(1, w);
+    frameH = Math.max(1, h);
+    debug = showDebug;
+    postInvalidate();
+}
+
+@Override
+protected void onDraw(Canvas canvas) {
+    super.onDraw(canvas);
+
+    float sx = getWidth() / (float) frameW;
+    float sy = getHeight() / (float) frameH;
+    canvas.save();
+    canvas.scale(sx, sy);
+
+    Vision.Result r = result;
+    if (r == null) {
+        canvas.restore();
+        return;
+    }
+
+    if (debug) {
+        paint.setStyle(Paint.Style.STROKE);
+        paint.setStrokeWidth(2f);
+        paint.setColor(Color.GREEN);
+        canvas.drawRect(r.tx, r.ty, r.tx + r.tw,
+                r.ty + r.th, paint);
+
+        paint.setStyle(Paint.Style.FILL);
+        paint.setTextSize(18f);
+        canvas.drawText("Balls: " + r.balls.size(),
+                12, 25, paint);
+    }
+
+    List<Vision.Ball> balls = r.balls;
+    for (Vision.Ball b : balls) {
+        paint.setStyle(Paint.Style.STROKE);
+        paint.setStrokeWidth(2.5f);
+        paint.setColor(b.kind == Vision.CUE
+                ? Color.CYAN
+                : b.kind == Vision.EIGHT
+                ? Color.WHITE
+                : b.kind == Vision.STRIPE
+                ? Color.YELLOW
+                : Color.GREEN);
+
+        canvas.drawCircle(b.x, b.y,
+                (float) Math.max(5, r.r), paint);
+    }
+
+    Vision.Shot s = r.shot;
+    if (s != null) {
+        paint.setStyle(Paint.Style.STROKE);
+        paint.setStrokeWidth(3f);
+        paint.setColor(Color.MAGENTA);
+
+        // Cue ball to ghost-ball contact point.
+        canvas.drawLine((float) s.cx, (float) s.cy,
+                (float) s.gx, (float) s.gy, paint);
+
+        // Target ball to selected pocket.
+        paint.setColor(Color.YELLOW);
+        canvas.drawLine((float) s.tx, (float) s.ty,
+                (float) s.px, (float) s.py, paint);
+
+        // Ghost-ball position.
+        paint.setColor(Color.CYAN);
+        canvas.drawCircle((float) s.gx, (float) s.gy,
+                (float) Math.max(4, r.r), paint);
+
+        // Selected target.
+        paint.setColor(Color.RED);
+        canvas.drawCircle((float) s.tx, (float) s.ty,
+                (float) Math.max(5, r.r * 1.2), paint);
+    }
+
+    canvas.restore();
+}
+
+}
+
 === app/src/main/java/app/aim/Vision.java ===
 package app.aim;
 
